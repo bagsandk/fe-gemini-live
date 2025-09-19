@@ -12,13 +12,13 @@ export default function Home() {
   const sessionRef = useRef(null);
   const sessionIdRef = useRef(null);
 
-  const capCtxRef = useRef(null); // AudioContext untuk capture mic
-  const playCtxRef = useRef(null); // AudioContext untuk playback
+  const capCtxRef = useRef(null); // AudioContext capture
+  const playCtxRef = useRef(null); // AudioContext playback
   const streamRef = useRef(null);
   const mediaNodeRef = useRef(null);
   const workletNodeRef = useRef(null);
 
-  const queueRef = useRef([]); // antrian Float32 untuk diputar
+  const queueRef = useRef([]); // Float32 playback queue
   const playingRef = useRef(false);
 
   const isOpenRef = useRef(false);
@@ -27,20 +27,59 @@ export default function Home() {
   const lastChunkAtRef = useRef(0);
   const turnTimerRef = useRef(null);
 
-  // Buffer transcript per turn (kumpulkan semua chunk)
-  const userChunksRef = useRef([]); // semua potongan user pada 1 turn
-  const modelChunksRef = useRef([]); // semua potongan model pada 1 turn
+  // ===== Transkrip per turn =====
+  // live = string kumulatif terakhir yang terlihat dari server
+  // agg  = gabungan ('append delta') untuk disimpan sebagai final
+  const userLiveRef = useRef("");
+  const userAggRef = useRef("");
+  const modelLiveRef = useRef("");
+  const modelAggRef = useRef("");
 
   const appendLog = (s) => setLogs((p) => [...p, s]);
-  const appendHistory = (who, text) => {
-    if (!text) return;
-    setHistory((h) => [
-      ...h,
-      { who, text, t: new Date().toLocaleTimeString() },
-    ]);
-  };
 
   // ==== utils ====
+  const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+
+  // Tambah delta: ambil perbedaan dari versi sebelumnya & append ke penampung
+  function appendDelta(liveRef, aggRef, nextText) {
+    const next = norm(nextText);
+    const prev = liveRef.current || "";
+    if (!prev) {
+      liveRef.current = next;
+      aggRef.current += next;
+      return;
+    }
+    if (next.startsWith(prev)) {
+      // kasus normal: kumulatif makin panjang
+      aggRef.current += next.slice(prev.length);
+    } else if (prev.startsWith(next)) {
+      // ASR “rewind” (lebih pendek) -> jangan append
+    } else {
+      // fallback: cari prefix yang sama, lalu append sisanya
+      let i = 0;
+      const m = Math.min(prev.length, next.length);
+      while (i < m && prev[i] === next[i]) i++;
+      const add = next.slice(i);
+      if (add) aggRef.current += add;
+    }
+    liveRef.current = next;
+  }
+
+  // History: upsert baris terakhir untuk live view
+  function upsertHistory(who, text) {
+    const t = new Date().toLocaleTimeString();
+    setHistory((h) => {
+      const hh = h.slice();
+      const last = hh[hh.length - 1];
+      if (last && last.who === who) {
+        hh[hh.length - 1] = { who, text, t };
+        return hh;
+      }
+      hh.push({ who, text, t });
+      return hh;
+    });
+  }
+
   function int16ToFloat32(int16buf) {
     const int16 = new Int16Array(int16buf);
     const f32 = new Float32Array(int16.length);
@@ -53,8 +92,6 @@ export default function Home() {
     for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
     return u8;
   }
-
-  // Int16Array -> base64
   function int16ToBase64(int16) {
     const u8 = new Uint8Array(int16.buffer, int16.byteOffset, int16.byteLength);
     let bin = "";
@@ -65,55 +102,7 @@ export default function Home() {
     return btoa(bin);
   }
 
-  // Gabung delta/kumulatif jadi 1 per turn
-  function pushChunkCumulative(listRef, chunk) {
-    if (!chunk) return;
-    const arr = listRef.current;
-    const last = arr[arr.length - 1];
-    if (!last) {
-      arr.push(chunk);
-      return;
-    }
-    if (chunk.length >= last.length && chunk.startsWith(last)) {
-      arr[arr.length - 1] = chunk; // kumulatif (replace yang terakhir)
-      return;
-    }
-    if (last.length > chunk.length && last.includes(chunk)) return; // duplikat kecil
-    arr.push(chunk); // tokenized → append
-  }
-  function finalizeUserText() {
-    const arr = userChunksRef.current;
-    if (!arr.length) return "";
-    let best = arr[0];
-    for (const s of arr) if (s.length > best.length) best = s;
-    return best.trim();
-  }
-  function finalizeModelText() {
-    const arr = modelChunksRef.current;
-    if (!arr.length) return "";
-    const out = [];
-    let acc = "";
-    for (const s of arr) {
-      if (!s) continue;
-      if (!acc) {
-        acc = s;
-        continue;
-      }
-      if (s.startsWith(acc)) {
-        acc = s;
-        continue;
-      } // kumulatif
-      if (acc.endsWith(s)) {
-        continue;
-      } // duplikat
-      out.push(acc);
-      acc = s;
-    }
-    out.push(acc);
-    return out.join(" ").replace(/\s+/g, " ").trim();
-  }
-
-  // === playback (pakai playCtx terpisah) ===
+  // === playback ===
   function pumpAudio() {
     if (!playCtxRef.current || playingRef.current) return;
     playingRef.current = true;
@@ -127,7 +116,7 @@ export default function Home() {
       }
       while (queueRef.current.length) {
         const f32 = queueRef.current.shift();
-        const buf = ctx.createBuffer(1, f32.length, 24000); // model out @24k
+        const buf = ctx.createBuffer(1, f32.length, 24000);
         buf.copyToChannel(f32, 0, 0);
         const src = ctx.createBufferSource();
         src.buffer = buf;
@@ -143,10 +132,14 @@ export default function Home() {
   // auto commit turn kalau diam
   function ensureTurnCommit() {
     clearInterval(turnTimerRef.current);
+    const SILENCE_MS = 1800;
     turnTimerRef.current = setInterval(() => {
       if (!isOpenRef.current) return;
       const now = Date.now();
-      if (sentSinceLastTurnRef.current && now - lastChunkAtRef.current > 900) {
+      if (
+        sentSinceLastTurnRef.current &&
+        now - lastChunkAtRef.current > SILENCE_MS
+      ) {
         sessionRef.current?.sendRealtimeInput?.({ turnComplete: true });
         sentSinceLastTurnRef.current = false;
         appendLog("↪️ turnComplete");
@@ -175,25 +168,21 @@ export default function Home() {
           turn_id: turnId || null,
         }),
       });
-      if (!res.ok) {
-        const t = await res.text();
-        appendLog(`POST /messages ${res.status}: ${t}`);
-      } else {
-        appendLog(`saved ${role} transcript (${text.length} chars)`);
-      }
+      if (!res.ok)
+        appendLog(`POST /messages ${res.status}: ${await res.text()}`);
+      else appendLog(`saved ${role} transcript (${text.length} chars)`);
     } catch (e) {
       appendLog(`saveTranscript error: ${e?.message || e}`);
     }
   }
 
+  // >>> konsisten model token & sesi (half-cascade)
   async function fetchToken() {
     const url = process.env.NEXT_PUBLIC_TOKEN_ENDPOINT;
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "gemini-2.5-flash-preview-native-audio-dialog",
-      }),
+      body: JSON.stringify({ model: "gemini-live-2.5-flash-preview" }),
     });
     if (!res.ok)
       throw new Error(`POST /token ${res.status}: ${await res.text()}`);
@@ -208,7 +197,7 @@ export default function Home() {
     connectingRef.current = true;
 
     try {
-      // Context capture (mic)
+      // Capture ctx
       if (!capCtxRef.current) {
         capCtxRef.current = new (window.AudioContext ||
           window.webkitAudioContext)();
@@ -217,7 +206,7 @@ export default function Home() {
       }
       appendLog(`CaptureContext SR: ${capCtxRef.current.sampleRate} Hz`);
 
-      // Context playback
+      // Playback ctx
       if (!playCtxRef.current) {
         try {
           playCtxRef.current = new (window.AudioContext ||
@@ -250,11 +239,11 @@ export default function Home() {
       const apiKey = await fetchToken();
       const ai = new GoogleGenAI({ apiKey, apiVersion: "v1alpha" });
 
-      const model = "gemini-2.5-flash-preview-native-audio-dialog";
+      const model = "gemini-live-2.5-flash-preview";
       const config = {
         responseModalities: [Modality.AUDIO],
-        inputAudioTranscription: { languageCode: "id-ID" }, // FE OK (BE yg penting valid)
-        outputAudioTranscription: { languageCode: "id-ID" },
+        inputAudioTranscription: {}, // aktifkan transkrip user
+        outputAudioTranscription: {}, // aktifkan transkrip AI
         speechConfig: {
           voiceConfig: { prebuiltVoiceConfig: { voiceName: "Zephyr" } },
         },
@@ -272,9 +261,14 @@ export default function Home() {
             setConnected(true);
             connectingRef.current = false;
             ensureTurnCommit();
+            // reset buffer turn
+            userLiveRef.current = "";
+            userAggRef.current = "";
+            modelLiveRef.current = "";
+            modelAggRef.current = "";
           },
           onmessage: async (msg) => {
-            // === AUDIO OUTPUT ===
+            // AUDIO out
             if (msg.data) {
               let ab = null;
               if (msg.data instanceof ArrayBuffer) ab = msg.data;
@@ -283,7 +277,6 @@ export default function Home() {
               else if (msg.data?.buffer instanceof ArrayBuffer)
                 ab = msg.data.buffer;
               if (ab) {
-                appendLog(`rx audio chunk: ${new Uint8Array(ab).length} bytes`);
                 if (playCtxRef.current?.state === "suspended") {
                   try {
                     await playCtxRef.current.resume();
@@ -294,28 +287,26 @@ export default function Home() {
               }
             }
 
-            // === TRANSKRIP & TURN ===
+            // TRANSKRIP: pakai transcription saja untuk live,
+            // tapi simpan ke penampung via append-delta supaya final "full".
             const sc = msg.serverContent || {};
-            const parts = sc.modelTurn?.parts || [];
-            const turnId = sc.modelTurn?.turnId;
+            const turnId = sc?.modelTurn?.turnId;
 
             if (sc.inputTranscription?.text) {
-              const t = sc.inputTranscription.text.trim();
-              pushChunkCumulative(userChunksRef, t);
-              appendHistory("You", t); // tampilkan incremental
+              appendDelta(userLiveRef, userAggRef, sc.inputTranscription.text);
+              upsertHistory("You", userLiveRef.current);
             }
             if (sc.outputTranscription?.text) {
-              const t = sc.outputTranscription.text.trim();
-              pushChunkCumulative(modelChunksRef, t);
-              appendHistory("Gemini", t);
+              appendDelta(
+                modelLiveRef,
+                modelAggRef,
+                sc.outputTranscription.text
+              );
+              upsertHistory("Gemini", modelLiveRef.current);
             }
-            // kadang teks AI datang via parts (tokenized)
-            for (const p of parts) {
-              if (p.text) {
-                const t = p.text.trim();
-                pushChunkCumulative(modelChunksRef, t);
-                appendHistory("Gemini", t);
-              }
+
+            // (opsional) audio inline via parts
+            for (const p of sc.modelTurn?.parts || []) {
               const inl = p?.inlineData;
               if (
                 inl?.data &&
@@ -323,24 +314,45 @@ export default function Home() {
                 (inl?.mimeType || "").startsWith("audio/")
               ) {
                 const u8 = b64ToUint8(inl.data);
-                appendLog(`rx audio inlineData: ${u8.byteLength} bytes`);
-                if (playCtxRef.current?.state === "suspended") {
-                  try {
-                    await playCtxRef.current.resume();
-                  } catch {}
-                }
                 queueRef.current.push(int16ToFloat32(u8.buffer));
                 pumpAudio();
               }
             }
 
-            if (sc.turnComplete) {
-              const finalUser = finalizeUserText();
-              const finalModel = finalizeModelText();
+            // FINALIZE per turn: kirim gabungan 'agg'.
+            if (sc.turnComplete || sc?.modelTurn?.turnComplete) {
+              // kalau ada teks lengkap di parts saat turnComplete, pilih yang lebih panjang
+              const modelParts = (sc?.modelTurn?.parts || [])
+                .map((p) => p?.text || "")
+                .filter(Boolean)
+                .join(" ");
+              const userParts = (sc?.userTurn?.parts || [])
+                .map((p) => p?.text || "")
+                .filter(Boolean)
+                .join(" ");
+
+              let finalUser = norm(
+                (userAggRef.current || "").length >= userParts.length
+                  ? userAggRef.current
+                  : userParts
+              );
+              let finalModel = norm(
+                (modelAggRef.current || "").length >= modelParts.length
+                  ? modelAggRef.current
+                  : modelParts
+              );
+
+              if (!finalUser) finalUser = norm(userLiveRef.current);
+              if (!finalModel) finalModel = norm(modelLiveRef.current);
+
               await saveTranscript("user", finalUser, turnId);
               await saveTranscript("model", finalModel, turnId);
-              userChunksRef.current = [];
-              modelChunksRef.current = [];
+
+              // reset buffers turn
+              userLiveRef.current = "";
+              userAggRef.current = "";
+              modelLiveRef.current = "";
+              modelAggRef.current = "";
             }
           },
           onerror: (e) =>
